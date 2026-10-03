@@ -1,0 +1,90 @@
+@startuml
+title Импорт CSV реестра овердрафтов: BackOffice → Temporal → Kafka → ЦФТ
+
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+participant "BackOffice" as BO
+participant "Импорт CSV\n(dbo-legals-overdrafts)" as IMP
+participant "Temporal\n(main + child workflows,\nconsumer в том же JVM)" as TW
+database "БД\n(import_files)" as DB
+participant "Kafka\n(legal_overdrafts_abs_contract_limit_updates\n/ _status)" as KF
+participant "ЦФТ (ABS)" as CFT
+
+== Загрузка файла ==
+
+BO -> IMP: POST /backoffice/v1/overdrafts/import-files\n(multipart CSV)
+activate IMP
+
+IMP -> DB: INSERT import_files:\nfile_content (BLOB), file_hash (UQ),\nfile_size, status=NEW
+activate DB
+DB --> IMP
+deactivate DB
+
+IMP -> TW: start ContractLimitImportWorkflow(importFileId)
+activate TW
+
+TW --> IMP: 202 Accepted {id, workflowId}
+deactivate TW
+
+IMP --> BO: 202 Accepted {id, workflowId}
+deactivate IMP
+
+== Обработка (main workflow) ==
+
+TW -> DB: UPDATE workflow_id, status=PROCESSING\nчитает file_content (BLOB)
+activate DB
+DB --> TW
+deactivate DB
+
+loop для каждой валидной строки (child workflow)
+    TW -> KF: SendContractLimitToCft → publish\nupdate_contract_limit\n(message_id, message_type=update_contract_limit,\ncontract_limit[])
+    activate KF
+
+    KF -> CFT: брокер доставляет:\nlegal_overdrafts_abs_contract_limit_updates
+    activate CFT
+
+    CFT -> KF: ЦФТ публикует ответ:\nlegal_overdrafts_abs_contract_limit_updates_status\n(message_id, result_code, result_description)
+    deactivate CFT
+
+    KF -> TW: consumer (тот же JVM,\ndbo-legals-overdrafts-contract-limit-status):\nответ по message_id (activity unblocked);\nchild workflow завершён
+    deactivate KF
+end
+
+note over TW
+  завершен
+  ПРОCESSED / CFT_REJECTED / SEND_FAILED /
+  VALIDATION_FAILED / DUPLICATE_IN_FILE) + counters
+end note
+
+TW -> DB: UPDATE import_files:\nresult_json (JSONB), status=COMPLETED
+activate DB
+DB --> TW
+deactivate DB
+
+== Получение результата (poll) ==
+
+BO -> IMP: GET /import-files/{id} (poll):\nstatus + counters (сводка)
+activate IMP
+IMP --> BO: {status: COMPLETED, counters: {...}}
+deactivate IMP
+
+BO -> IMP: GET /import-files/{id}/rows?status=&offset=&limit=\n(статусы по отдельным записям,\nпарсинг BLOB на лету)
+activate IMP
+IMP --> BO: {rows: [...], offset, limit}
+deactivate IMP
+
+note over BO, CFT
+  Q1: сервис — транспорт; лимит в БД обновляется ТОЛЬКО
+       из снапшота овердрафта от ЦФТ (импорт не пишет).
+  Retry: main — без автоматических retry; child — ошибка строки
+       НЕ прерывает main (Q10).
+  WorkflowExecutionTimeout = 1 ч → алерт (канал уточняется, Q8);
+       метрика overdrafts.import.workflow.duration.
+  Идемпотентность: UNIQUE (file_hash); повторный upload →
+       возврат существующей записи.
+  Открыто: Q4 (рубли/копейки), Q5 (lookup по INN),
+       Q9 (параллелизм child).
+end note
+
+@enduml
