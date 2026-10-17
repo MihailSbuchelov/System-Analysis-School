@@ -276,7 +276,6 @@ heroes M ──── N skills (через hero_skills)
 quests 1 ──── N rewards
 lords  1 ──── N rewards
 ```
-
 ---
 
 ## 4. Типы данных — грабли
