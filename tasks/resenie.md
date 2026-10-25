@@ -2,7 +2,39 @@
 
 ---
 
-## 1. Модель данных (5 таблиц)
+## 1. Целевые сценарии
+
+### Сценарий 1: Пользователь оформляет заказ (синхронный, запись)
+
+Пользователь нажимает «Оформить заказ» (POST `/api/v1/orders`, header `Idempotency-Key: req-abc-123`, body: список товаров с количеством).
+
+1. Сервер проверяет `Idempotency-Key` в таблице `idempotency_keys`. Если ключ уже есть — возвращает ответ с первоначального заказа (повторный клик), не создаёт новый.
+2. В транзакции: `SELECT ... FROM products WHERE id IN (...) FOR UPDATE` — блокирует строки товаров, читает `stock`. Если `stock < quantity` для любого товара → ROLLBACK, 409 INSUFFICIENT_STOCK.
+3. `UPDATE products SET stock = stock - qty` — списывает со склада.
+4. `INSERT INTO orders (user_id, status, total_cents)` — создаёт заказ со статусом `PENDING`.
+5. `INSERT INTO order_items (order_id, product_id, quantity, price_cents)` — позиции заказа.
+6. `INSERT INTO idempotency_keys (key, order_id)` — фиксирует ключ.
+7. COMMIT. Ответ: 201 `{orderId, status: "PENDING", totalCents}`.
+
+**При ошибке:** если на складе не хватает товара — транзакция откатывается, stock не меняется, пользователь получает 409. Если `Idempotency-Key` дубль — 201 с тем же orderId (не 409).
+
+### Сценарий 2: Пользователь смотрит «Мои заказы» (синхронный, чтение)
+
+**Список** (GET `/api/v1/orders?page=1&size=20`):
+1. Сервер из JWT берёт `user_id`.
+2. `SELECT id, status, total_cents, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20 OFFSET 0` — использует индекс `(user_id, created_at DESC)`.
+3. Ответ: 200 `{items: [...], page, size, total}`.
+
+**Детали** (GET `/api/v1/orders/77`):
+1. Сервер проверяет, что заказ принадлежит пользователю: `SELECT status FROM orders WHERE id = 77 AND user_id = ?`. Если нет — 404.
+2. `SELECT oi.product_id, p.name, oi.quantity, oi.price_cents FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.order_id = 77` — использует индекс `(order_id)` в `order_items`.
+3. Ответ: 200 `{orderId, status, totalCents, createdAt, items: [...]}`.
+
+**При ошибке:** если заказа нет или он чужой — 404 (не 403, чтобы не раскрывать существование чужих заказов).
+
+---
+
+## 2. Модель данных (5 таблиц)
 
 ### `products` (дана, не менять)
 
@@ -66,9 +98,22 @@ CREATE TABLE idempotency_keys (
 );
 ```
 
+**Зачем:** пользователь нажимает «Оформить заказ». Запрос ушёл, но ответ ещё не пришёл (сеть медленная). Пользователь думает, что не сработало, нажимает **второй раз**. Без защиты — два заказа, товар списан дважды.
+
+**Как работает:**
+1. Клиент генерирует уникальный ключ (UUID) **на каждый запрос**: `Idempotency-Key: req-abc-123`
+2. Сервер **до** создания заказа делает: `SELECT order_id FROM idempotency_keys WHERE key = 'req-abc-123'`
+3. Если ключ **уже есть** → значит, это повтор **того же** запроса (двойной клик). Сервер **не создаёт** новый заказ, а возвращает ответ с **первоначального** (201 + тот же `orderId`)
+4. Если ключ **нового** → создаём заказ, в конце транзакции: `INSERT INTO idempotency_keys (key, order_id) VALUES ('req-abc-123', 77)`
+
+**Через день новый заказ — новый UUID.**
+Клиент генерирует UUID **на каждый запрос**, не на сессию. Первый заказ: `req-abc-123`. Через день: `req-xyz-789`. Сервер ищет `req-xyz-789` — не находит → создаёт новый заказ. Старый ключ `req-abc-123` не мешает.
+
+**Ключевое:** ключ хранится **в той же транзакции**, что и заказ. Если транзакция откатилась — ключ тоже исчез, и повторный запрос создаст заказ заново (это корректно: первый заказ не был создан).
+
 ---
 
-## 2. Связи
+## 3. Связи
 
 ```
 users  1 ──── N orders          (FK user_id в orders)
@@ -79,7 +124,7 @@ users  1 ──── N idempotency_keys (FK order_id, key UNIQUE)
 
 ---
 
-## 3. Индексы
+## 4. Индексы
 
 | # | Запрос (из сценария) | Индекс | Почему |
 |---|---|---|---|
@@ -93,7 +138,7 @@ users  1 ──── N idempotency_keys (FK order_id, key UNIQUE)
 
 ---
 
-## 4. REST API
+## 5. REST API
 
 ### Сценарий 1: Оформить заказ
 
@@ -183,7 +228,7 @@ Headers:
 
 ---
 
-## 5. SQL-запросы
+## 6. SQL-запросы
 
 ### Сценарий 1: Проверка наличия
 
@@ -250,7 +295,7 @@ WHERE oi.order_id = 77;
 
 ---
 
-## 6. Ответы на вопросы
+## 7. Ответы на вопросы
 
 **Сценарий 1:**
 
@@ -267,7 +312,7 @@ WHERE oi.order_id = 77;
 
 ---
 
-## 7. Что проверить на собесе
+## 8. Что проверить на собесе
 
 - [ ] 5 таблиц, M:N через order_items
 - [ ] `price_cents` в order_items — денормализация осознанная (цена на момент покупки)
